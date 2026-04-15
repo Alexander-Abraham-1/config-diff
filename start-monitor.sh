@@ -1,20 +1,9 @@
 #!/bin/bash
 
 # WebSphere Audit Monitor Startup Script
-# Usage: ./start-monitor.sh <username> <password> [config.properties]
+# Usage: ./start-monitor.sh [config.properties]
 
-if [ $# -lt 2 ]; then
-    echo "Usage: $0 <username> <password> [config.properties]"
-    echo ""
-    echo "Example:"
-    echo "  $0 admin mypassword"
-    echo "  $0 admin mypassword /path/to/config.properties"
-    exit 1
-fi
-
-USERNAME=$1
-PASSWORD=$2
-CONFIG=${3:-config.properties}
+CONFIG=${1:-config.properties}
 
 # Check if Java class exists
 if [ ! -f "WebSphereAuditMonitor.class" ]; then
@@ -43,13 +32,14 @@ fi
 
 # Start the monitor in background
 echo "Starting WebSphere Audit Monitor..."
-nohup ../WebSphere905/AppServer/java/8.0/bin/java WebSphereAuditMonitor "$USERNAME" "$PASSWORD" "$CONFIG" > monitor.log 2>&1 &
+nohup java WebSphereAuditMonitor "$CONFIG" > monitor.log 2>&1 &
 PID=$!
 
 # Save PID
 echo $PID > "$PID_FILE"
 
 echo "Monitor started with PID: $PID"
+echo "Config file: $CONFIG"
 echo "Log file: monitor.log"
 echo "To stop: ./stop-monitor.sh"
 echo "To view logs: tail -f monitor.log"

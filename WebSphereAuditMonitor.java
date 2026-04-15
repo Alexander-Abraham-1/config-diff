@@ -39,19 +39,14 @@ class StringUtils {
 /**
  * WebSphere Configuration Audit Monitor
  *
- * Usage: java WebSphereAuditMonitor <username> <password> [config.properties]
+ * Usage: java WebSphereAuditMonitor [config.properties]
  *
  * Arguments:
- * - username: WebSphere admin username (required)
- * - password: WebSphere admin password (required)
  * - config.properties: Configuration file path (optional, defaults to config.properties)
  *
  * Configuration properties:
  * - checkpoint.directory=/dmgr/config/temp/download/cells/was90cell/repository/checkpoints
  * - wsadmin.path=/opt/IBM/WebSphere/AppServer/bin
- * - wsadmin.conntype=SOAP (connection type: SOAP, RMI, IPC, NONE)
- * - wsadmin.host=localhost (WebSphere server host)
- * - wsadmin.port=8879 (WebSphere SOAP port, typically 8879 for dmgr)
  * - audit.log.path=./audit.log
  * - schedule.interval.minutes=60
  * - last.processed.timestamp.file=.last_processed_timestamp
@@ -62,19 +57,15 @@ public class WebSphereAuditMonitor {
     private Properties config;
     private String checkpointDir;
     private String wsadminPath;
-    private String wsadminConnType;
-    private String wsadminHost;
-    private String wsadminPort;
-    private String username;
-    private String password;
     private String auditLogPath;
     private int scheduleIntervalMinutes;
     private String lastProcessedTimestampFile;
     private long lastProcessedTimestamp = 0;
+    private long maxLogSizeMB;
+    private int maxLogFiles;
+    private String archivedLogsDir;
     
-    public WebSphereAuditMonitor(String username, String password, String configFile) throws IOException {
-        this.username = username;
-        this.password = password;
+    public WebSphereAuditMonitor(String configFile) throws IOException {
         loadConfiguration(configFile);
         loadLastProcessedTimestamp();
     }
@@ -98,24 +89,24 @@ public class WebSphereAuditMonitor {
         checkpointDir = config.getProperty("checkpoint.directory",
             "/dmgr/config/temp/download/cells/was90cell/repository/checkpoints");
         wsadminPath = config.getProperty("wsadmin.path", "/opt/IBM/WebSphere/AppServer/bin");
-        wsadminConnType = config.getProperty("wsadmin.conntype", "SOAP");
-        wsadminHost = config.getProperty("wsadmin.host", "localhost");
-        wsadminPort = config.getProperty("wsadmin.port", "8879");
         auditLogPath = config.getProperty("audit.log.path", "./audit.log");
         scheduleIntervalMinutes = Integer.parseInt(config.getProperty("schedule.interval.minutes", "60"));
         lastProcessedTimestampFile = config.getProperty("last.processed.timestamp.file", ".last_processed_timestamp");
+        maxLogSizeMB = Long.parseLong(config.getProperty("audit.log.max.size.mb", "5"));
+        maxLogFiles = Integer.parseInt(config.getProperty("audit.log.max.files", "10"));
+        archivedLogsDir = config.getProperty("audit.log.archive.dir", "./archived_logs");
     }
     
     private void createDefaultConfig(String configFile) throws IOException {
         Properties defaultConfig = new Properties();
         defaultConfig.setProperty("checkpoint.directory", "/dmgr/config/temp/download/cells/was90cell/repository/checkpoints");
         defaultConfig.setProperty("wsadmin.path", "/opt/IBM/WebSphere/AppServer/bin");
-        defaultConfig.setProperty("wsadmin.conntype", "SOAP");
-        defaultConfig.setProperty("wsadmin.host", "localhost");
-        defaultConfig.setProperty("wsadmin.port", "8879");
         defaultConfig.setProperty("audit.log.path", "./audit.log");
         defaultConfig.setProperty("schedule.interval.minutes", "60");
         defaultConfig.setProperty("last.processed.timestamp.file", ".last_processed_timestamp");
+        defaultConfig.setProperty("audit.log.max.size.mb", "5");
+        defaultConfig.setProperty("audit.log.max.files", "10");
+        defaultConfig.setProperty("audit.log.archive.dir", "./archived_logs");
         
         try (FileOutputStream fos = new FileOutputStream(configFile)) {
             defaultConfig.store(fos, "WebSphere Audit Monitor Configuration");
@@ -283,11 +274,7 @@ public class WebSphereAuditMonitor {
             System.out.println("  Python script path: " + scriptFile.getAbsolutePath());
             ProcessBuilder pb = new ProcessBuilder(
                 wsadminScript,
-                "-conntype", wsadminConnType,
-                "-host", wsadminHost,
-                "-port", wsadminPort,
-                "-user", username,
-                "-password", password,
+                "-conntype", "NONE",
                 "-f", scriptFile.getAbsolutePath()
             );
             
@@ -612,6 +599,9 @@ public class WebSphereAuditMonitor {
     }
     
     private void writeAuditLog(List<AuditEntry> auditEntries) {
+        // Check if log rolling is needed before writing
+        rollLogFileIfNeeded();
+        
         // Sort by timestamp
         auditEntries.sort(Comparator.comparingLong(e -> e.timestamp));
         
@@ -625,6 +615,7 @@ public class WebSphereAuditMonitor {
             for (AuditEntry entry : auditEntries) {
                 writer.println("\nTimestamp: " + sdf.format(new Date(entry.timestamp)));
                 writer.println("User: " + entry.userId);
+                writer.println("Cell: " + entry.cellName);
                 writer.println("File: " + entry.filePath);
                 writer.println("Change Type: " + entry.changeType);
                 writer.println("Changes:");
@@ -640,6 +631,141 @@ public class WebSphereAuditMonitor {
         } catch (IOException e) {
             System.err.println("Error writing audit log: " + e.getMessage());
             e.printStackTrace();
+        }
+    }
+    
+    private void rollLogFileIfNeeded() {
+        File logFile = new File(auditLogPath);
+        
+        // Check if file exists and size exceeds limit
+        if (!logFile.exists() || logFile.length() < maxLogSizeMB * 1024 * 1024) {
+            return; // No rolling needed
+        }
+        
+        try {
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd-HHmmss");
+            String timestamp = sdf.format(new Date());
+            
+            // Count existing rolled log files
+            File logDir = logFile.getParentFile();
+            if (logDir == null) {
+                logDir = new File(".");
+            }
+            
+            String logBaseName = logFile.getName();
+            File[] existingLogs = logDir.listFiles((dir, name) ->
+                name.startsWith(logBaseName + ".") && !name.endsWith(".zip"));
+            
+            int currentLogCount = existingLogs != null ? existingLogs.length : 0;
+            
+            // Roll current log file with timestamp
+            String rolledLogName = logBaseName + "." + timestamp;
+            File rolledLog = new File(logDir, rolledLogName);
+            
+            if (logFile.renameTo(rolledLog)) {
+                System.out.println("Rolled audit log: " + logFile.getName() + " -> " + rolledLogName);
+                
+                // Check if we've reached the max file count
+                if (currentLogCount >= maxLogFiles) {
+                    System.out.println("Maximum log files (" + maxLogFiles + ") reached. Archiving old logs...");
+                    archiveOldLogs(logDir, logBaseName);
+                }
+            } else {
+                System.err.println("Failed to roll audit log file");
+            }
+            
+        } catch (Exception e) {
+            System.err.println("Error during log rolling: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+    
+    private void archiveOldLogs(File logDir, String logBaseName) {
+        try {
+            // Create archive directory if it doesn't exist
+            File archiveDir = new File(archivedLogsDir);
+            if (!archiveDir.exists()) {
+                archiveDir.mkdirs();
+            }
+            
+            // Get all rolled log files (excluding already zipped ones)
+            File[] rolledLogs = logDir.listFiles((dir, name) ->
+                name.startsWith(logBaseName + ".") && !name.endsWith(".zip"));
+            
+            if (rolledLogs == null || rolledLogs.length == 0) {
+                return;
+            }
+            
+            // Sort by last modified time (oldest first)
+            Arrays.sort(rolledLogs, Comparator.comparingLong(File::lastModified));
+            
+            // Create timestamped archive folder
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd-HHmmss");
+            String archiveTimestamp = sdf.format(new Date());
+            File archiveFolder = new File(archiveDir, "audit_logs_" + archiveTimestamp);
+            archiveFolder.mkdirs();
+            
+            // Move old log files to archive folder
+            int filesToArchive = rolledLogs.length - maxLogFiles + 1;
+            if (filesToArchive <= 0) {
+                return;
+            }
+            
+            List<File> archivedFiles = new ArrayList<>();
+            for (int i = 0; i < filesToArchive && i < rolledLogs.length; i++) {
+                File oldLog = rolledLogs[i];
+                File archivedLog = new File(archiveFolder, oldLog.getName());
+                if (oldLog.renameTo(archivedLog)) {
+                    archivedFiles.add(archivedLog);
+                    System.out.println("Moved to archive: " + oldLog.getName());
+                }
+            }
+            
+            // Zip the archive folder
+            if (!archivedFiles.isEmpty()) {
+                String zipFileName = "audit_logs_" + archiveTimestamp + ".zip";
+                File zipFile = new File(archiveDir, zipFileName);
+                zipDirectory(archiveFolder, zipFile);
+                
+                // Delete the archive folder after zipping
+                deleteDirectory(archiveFolder);
+                
+                System.out.println("Created archive: " + zipFileName + " (" + archivedFiles.size() + " files)");
+            }
+            
+        } catch (Exception e) {
+            System.err.println("Error archiving old logs: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+    
+    private void zipDirectory(File sourceDir, File zipFile) throws IOException {
+        try (FileOutputStream fos = new FileOutputStream(zipFile);
+             java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(fos)) {
+            
+            File[] files = sourceDir.listFiles();
+            if (files != null) {
+                for (File file : files) {
+                    if (file.isFile()) {
+                        addFileToZip(file, file.getName(), zos);
+                    }
+                }
+            }
+        }
+    }
+    
+    private void addFileToZip(File file, String fileName, java.util.zip.ZipOutputStream zos) throws IOException {
+        try (FileInputStream fis = new FileInputStream(file)) {
+            java.util.zip.ZipEntry zipEntry = new java.util.zip.ZipEntry(fileName);
+            zos.putNextEntry(zipEntry);
+            
+            byte[] buffer = new byte[1024];
+            int length;
+            while ((length = fis.read(buffer)) > 0) {
+                zos.write(buffer, 0, length);
+            }
+            
+            zos.closeEntry();
         }
     }
     
@@ -674,6 +800,7 @@ public class WebSphereAuditMonitor {
         long timestamp;
         String userId;
         String filePath;
+        String cellName;
         String changeType;
         List<String> differences;
         
@@ -681,32 +808,29 @@ public class WebSphereAuditMonitor {
             this.timestamp = timestamp;
             this.userId = userId;
             this.filePath = filePath;
+            this.cellName = extractCellName(filePath);
             this.changeType = changeType;
             this.differences = differences;
+        }
+        
+        private static String extractCellName(String filePath) {
+            // Extract cell name from path like: cells/was90cell/nodes/...
+            // Cell name is between first and second /
+            if (filePath != null && filePath.startsWith("cells/")) {
+                String[] parts = filePath.split("/");
+                if (parts.length >= 2) {
+                    return parts[1]; // Return was90cell
+                }
+            }
+            return "Unknown";
         }
     }
     
     public static void main(String[] args) {
-        if (args.length < 2) {
-            System.err.println("Usage: java WebSphereAuditMonitor <username> <password> [config.properties]");
-            System.err.println();
-            System.err.println("Arguments:");
-            System.err.println("  username          - WebSphere admin username (required)");
-            System.err.println("  password          - WebSphere admin password (required)");
-            System.err.println("  config.properties - Configuration file path (optional, defaults to config.properties)");
-            System.err.println();
-            System.err.println("Example:");
-            System.err.println("  java WebSphereAuditMonitor admin mypassword");
-            System.err.println("  java WebSphereAuditMonitor admin mypassword /path/to/config.properties");
-            System.exit(1);
-        }
-        
-        String username = args[0];
-        String password = args[1];
-        String configFile = args.length > 2 ? args[2] : DEFAULT_CONFIG;
+        String configFile = args.length > 0 ? args[0] : DEFAULT_CONFIG;
         
         try {
-            WebSphereAuditMonitor monitor = new WebSphereAuditMonitor(username, password, configFile);
+            WebSphereAuditMonitor monitor = new WebSphereAuditMonitor(configFile);
             monitor.start();
         } catch (Exception e) {
             System.err.println("Error starting WebSphere Audit Monitor: " + e.getMessage());

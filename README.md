@@ -38,7 +38,12 @@ chmod +x start-monitor.sh stop-monitor.sh status-monitor.sh
 
 Start the monitor in background:
 ```bash
-./start-monitor.sh admin mypassword
+./start-monitor.sh
+```
+
+Or with custom config file:
+```bash
+./start-monitor.sh /path/to/config.properties
 ```
 
 Check status:
@@ -58,25 +63,23 @@ tail -f monitor.log
 
 #### Option B: Direct Java Execution
 
-First run will create a default configuration file (username and password are required):
+First run will create a default configuration file:
 
 ```bash
-java WebSphereAuditMonitor admin mypassword
+java WebSphereAuditMonitor
 ```
 
 Or specify a custom config file:
 
 ```bash
-java WebSphereAuditMonitor admin mypassword myconfig.properties
+java WebSphereAuditMonitor myconfig.properties
 ```
 
 Run in background manually:
 ```bash
-nohup java WebSphereAuditMonitor admin mypassword > monitor.log 2>&1 &
+nohup java WebSphereAuditMonitor > monitor.log 2>&1 &
 echo $! > .monitor.pid
 ```
-
-**Note:** Username and password are passed as command-line arguments for security (not stored in config file).
 
 ### 3. Configure
 
@@ -89,11 +92,6 @@ checkpoint.directory=/dmgr/config/temp/download/cells/was90cell/repository/check
 # Path to WebSphere wsadmin.sh directory
 wsadmin.path=/opt/IBM/WebSphere/AppServer/bin
 
-# WebSphere connection parameters
-wsadmin.conntype=SOAP
-wsadmin.host=localhost
-wsadmin.port=8879
-
 # Output audit log file path
 audit.log.path=./audit.log
 
@@ -102,30 +100,48 @@ schedule.interval.minutes=60
 
 # File to track last processed timestamp
 last.processed.timestamp.file=.last_processed_timestamp
+
+# Log rolling configuration
+audit.log.max.size.mb=5          # Maximum log file size before rolling (in MB)
+audit.log.max.files=10           # Maximum number of rolled log files to keep
+audit.log.archive.dir=./archived_logs  # Directory for archived log files
 ```
 
-**Connection Type Options:**
-- `SOAP` - SOAP connector (default, most common)
-- `RMI` - RMI connector
-- `IPC` - Local IPC connector
-- `NONE` - No connector (local mode)
+**Note:** The monitor uses wsadmin with `-conntype NONE` (offline mode) to extract checkpoints without requiring an active WebSphere connection.
 
-**Common Ports:**
-- SOAP: 8879 (dmgr)
-- RMI: 2809 (dmgr)
+### Log Rolling Feature
+
+The audit log automatically rolls when it reaches the configured size limit:
+
+**How it works:**
+1. When `audit.log` reaches the size limit (default: 5MB), it's renamed with a timestamp
+   - Example: `audit.log.20260415-143022`
+2. A new `audit.log` file is created for new entries
+3. When the number of rolled files exceeds the limit (default: 10):
+   - Oldest log files are moved to an archive folder
+   - Archive folder is named with timestamp: `audit_logs_20260415-143022`
+   - Archive folder is zipped: `audit_logs_20260415-143022.zip`
+   - Original files are deleted after zipping
+4. All history is preserved in timestamped zip files in the `archived_logs` directory
+
+**Benefits:**
+- Prevents audit.log from growing indefinitely
+- Maintains complete history (nothing is deleted)
+- Automatic archiving and compression
+- Easy to manage and review old logs
 
 ### 4. Run Again
 
-After configuration, run the program again with your credentials:
+After configuration, run the program again:
 
 ```bash
-java WebSphereAuditMonitor admin mypassword
+java WebSphereAuditMonitor
 ```
 
 Or with custom config file:
 
 ```bash
-java WebSphereAuditMonitor admin mypassword myconfig.properties
+java WebSphereAuditMonitor myconfig.properties
 ```
 
 The program will:
@@ -158,17 +174,19 @@ Audit Log Entry - 2025-12-14 15:25:30
 
 Timestamp: 2025-12-14 15:20:15
 User: wasadmin
-File: config/cells/cell01/applications/app.xml
+Cell: cell01
+File: cells/cell01/applications/app.xml
 Change Type: MODIFIED
 Changes:
-  Line 15 changed:
-  Before: <property name="timeout" value="30"/>
-  After:  <property name="timeout" value="60"/>
+  Line 15 modified:
+    Before: <property name="timeout" value="30"/>
+    After:  <property name="timeout" value="60"/>
 --------------------------------------------------------------------------------
 
 Timestamp: 2025-12-14 15:21:45
 User: wasadmin
-File: config/cells/cell01/security/security.xml
+Cell: cell01
+File: cells/cell01/security/security.xml
 Change Type: ADDED
 Changes:
   File created
@@ -310,7 +328,3 @@ Three shell scripts are included for easy process management:
 - All changes are logged in chronological order
 - Binary files are skipped in comparison
 - Large files may take time to process
-
-## License
-
-This is a utility tool for WebSphere administration and auditing purposes.
