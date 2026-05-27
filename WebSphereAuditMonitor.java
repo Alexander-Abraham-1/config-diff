@@ -1,20 +1,6 @@
-/*******************************************************************************
- * Copyright (c) 2026 IBM Corp.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *******************************************************************************/
-
 import java.io.*;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.text.SimpleDateFormat;
 import java.util.*;
@@ -325,6 +311,94 @@ public class WebSphereAuditMonitor {
         return scriptFile;
     }
     
+    /**
+     * Read user.id file with proper encoding handling for z/OS EBCDIC
+     * Attempts to detect and convert EBCDIC encoding to UTF-8
+     */
+    private String readUserIdWithEncoding(File userIdFile) throws IOException {
+        byte[] bytes = Files.readAllBytes(userIdFile.toPath());
+        
+        // Try to detect if content is EBCDIC by checking for common EBCDIC patterns
+        // EBCDIC space is 0x40, and printable characters are in different ranges
+        boolean likelyEbcdic = isLikelyEbcdic(bytes);
+        
+        String userId;
+        if (likelyEbcdic) {
+            // Convert from EBCDIC to UTF-8
+            try {
+                // IBM EBCDIC charset (Cp037 is US EBCDIC, Cp1047 is Latin-1 EBCDIC)
+                // Try Cp1047 first (most common for z/OS)
+                Charset ebcdicCharset = Charset.forName("Cp1047");
+                userId = new String(bytes, ebcdicCharset);
+                System.out.println("  Detected EBCDIC encoding, converted to UTF-8");
+            } catch (Exception e) {
+                // Fallback to Cp037 if Cp1047 is not available
+                try {
+                    Charset ebcdicCharset = Charset.forName("Cp037");
+                    userId = new String(bytes, ebcdicCharset);
+                    System.out.println("  Detected EBCDIC encoding (Cp037), converted to UTF-8");
+                } catch (Exception e2) {
+                    // If EBCDIC charsets are not available, use default
+                    System.err.println("  Warning: EBCDIC charset not available, using default encoding");
+                    userId = new String(bytes, StandardCharsets.UTF_8);
+                }
+            }
+        } else {
+            // Assume UTF-8 or ASCII
+            userId = new String(bytes, StandardCharsets.UTF_8);
+        }
+        
+        return userId.trim();
+    }
+    
+    /**
+     * Heuristic to detect if byte array is likely EBCDIC encoded
+     * EBCDIC has different byte ranges for printable characters
+     */
+    private boolean isLikelyEbcdic(byte[] bytes) {
+        if (bytes.length == 0) {
+            return false;
+        }
+        
+        int ebcdicIndicators = 0;
+        int totalBytes = Math.min(bytes.length, 100); // Check first 100 bytes
+        
+        for (int i = 0; i < totalBytes; i++) {
+            int b = bytes[i] & 0xFF; // Convert to unsigned
+            
+            // EBCDIC space is 0x40 (64 decimal)
+            // EBCDIC lowercase letters: a-i (0x81-0x89), j-r (0x91-0x99), s-z (0xA2-0xA9)
+            // EBCDIC uppercase letters: A-I (0xC1-0xC9), J-R (0xD1-0xD9), S-Z (0xE2-0xE9)
+            // EBCDIC digits: 0-9 (0xF0-0xF9)
+            
+            if (b == 0x40 || // EBCDIC space
+                (b >= 0x81 && b <= 0x89) || // a-i
+                (b >= 0x91 && b <= 0x99) || // j-r
+                (b >= 0xA2 && b <= 0xA9) || // s-z
+                (b >= 0xC1 && b <= 0xC9) || // A-I
+                (b >= 0xD1 && b <= 0xD9) || // J-R
+                (b >= 0xE2 && b <= 0xE9) || // S-Z
+                (b >= 0xF0 && b <= 0xF9)) { // 0-9
+                ebcdicIndicators++;
+            }
+            
+            // ASCII/UTF-8 printable range is 0x20-0x7E
+            // If we see characters outside this range that match EBCDIC patterns, likely EBCDIC
+            if (b > 0x7E && (
+                (b >= 0x81 && b <= 0x89) ||
+                (b >= 0x91 && b <= 0x99) ||
+                (b >= 0xA2 && b <= 0xA9) ||
+                (b >= 0xC1 && b <= 0xC9) ||
+                (b >= 0xD1 && b <= 0xD9) ||
+                (b >= 0xE2 && b <= 0xE9))) {
+                ebcdicIndicators += 2; // Weight these more heavily
+            }
+        }
+        
+        // If more than 30% of bytes match EBCDIC patterns, consider it EBCDIC
+        return (ebcdicIndicators * 100.0 / totalBytes) > 30;
+    }
+    
     private List<AuditEntry> processZipFile(File zipFile, DeltaDirectory deltaDir) throws IOException {
         List<AuditEntry> auditEntries = new ArrayList<>();
         
@@ -339,7 +413,7 @@ public class WebSphereAuditMonitor {
             File userIdFile = new File(tempDir, "user.id");
             String userId = "Unknown";
             if (userIdFile.exists()) {
-                userId = new String(Files.readAllBytes(userIdFile.toPath())).trim();
+                userId = readUserIdWithEncoding(userIdFile);
             }
             
             // Process before and after directories
